@@ -1,0 +1,12 @@
+{
+  "name": "stock-gallery",
+  "version": "0.2.0",
+  "type": "module",
+  "private": true,
+  "main": "server.mjs",
+  "dependencies": {
+    "sharp": "^0.34.1",
+    "dockerode": "^4.0.2",
+    "archiver": "^7.0.1"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "comfy-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "main": "server.mjs",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "dockerode": "^4.0.2"
+  }
+}

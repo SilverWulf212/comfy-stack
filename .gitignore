@@ -1,0 +1,10 @@
+node_modules/
+*.log
+state/
+gallery/*.png
+gallery/*.jpg
+gallery/*.jpeg
+gallery/*.webp
+gallery/index.html
+.env
+.DS_Store

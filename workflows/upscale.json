@@ -1,0 +1,42 @@
+{
+  "_meta": {
+    "name": "upscale",
+    "description": "Real-ESRGAN x4 upscale + sharpen. Input image must be uploaded to ComfyUI's input folder first via /upload/image. Output is a 4x PNG saved to output folder; the gallery API then sharps→2x→webp encodes it.",
+    "params": ["input_image"]
+  },
+  "1": {
+    "class_type": "LoadImage",
+    "inputs": {
+      "image": "{{input_image}}"
+    }
+  },
+  "2": {
+    "class_type": "UpscaleModelLoader",
+    "inputs": {
+      "model_name": "RealESRGAN_x4plus.pth"
+    }
+  },
+  "3": {
+    "class_type": "ImageUpscaleWithModel",
+    "inputs": {
+      "upscale_model": ["2", 0],
+      "image": ["1", 0]
+    }
+  },
+  "4": {
+    "class_type": "ImageSharpen",
+    "inputs": {
+      "image": ["3", 0],
+      "sharpen_radius": 1,
+      "sigma": 1.0,
+      "alpha": 0.5
+    }
+  },
+  "5": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "filename_prefix": "upscaled",
+      "images": ["4", 0]
+    }
+  }
+}
