@@ -7,6 +7,7 @@
   "dependencies": {
     "sharp": "^0.34.1",
     "dockerode": "^4.0.2",
-    "archiver": "^7.0.1"
+    "archiver": "^7.0.1",
+    "ioredis": "^5.4.1"
   }
 }

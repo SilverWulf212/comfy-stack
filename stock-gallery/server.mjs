@@ -28,6 +28,7 @@ import crypto from "node:crypto";
 import sharp from "sharp";
 import Docker from "dockerode";
 import archiver from "archiver";
+import Redis from "ioredis";
 
 // ---------- Config ----------
 const PORT            = Number(process.env.PORT || 80);
@@ -41,12 +42,17 @@ const OLLAMA_URL = process.env.OLLAMA_URL || "http://ollama:11434";
 const WARM_GEN_MODELS   = (process.env.WARM_GEN_MODELS   || "qwen3.5:9b,qwen3.5:4b").split(",").map(s => s.trim()).filter(Boolean);
 const WARM_EMBED_MODELS = (process.env.WARM_EMBED_MODELS || "nomic-embed-text").split(",").map(s => s.trim()).filter(Boolean);
 const ENHANCE_MODEL   = process.env.ENHANCE_MODEL || "qwen3.5:4b";
+const REDIS_URL       = process.env.REDIS_URL || "redis://onyx-cache:6379";
 
 const POLL_INTERVAL_MS = 1000;
 const POLL_TIMEOUT_MS  = 5 * 60 * 1000;
 const MAX_QUEUE        = 16;
 const MAX_PROMPT_LEN   = 1000;
 const ENHANCE_TIMEOUT_MS = 30_000;
+const TAGS_TIMEOUT_MS    = 20_000;
+const PAGE_SIZE          = 50;
+const CACHE_TTL_SECONDS  = 300; // 5 min for sidecars + tag index
+const CACHE_HTML_TTL     = 60;  // 1 min for rendered HTML pages
 
 // ---------- Styles ----------
 // NOTE: the {{prompt}} placeholder here is consumed by enhancePrompt(), NOT by deepReplace().
@@ -103,6 +109,46 @@ const ORIENTATIONS = {
 
 // ---------- Utilities ----------
 const docker = new Docker({ socketPath: "/var/run/docker.sock" });
+
+// ---------- Redis cache (graceful degradation when down) ----------
+// Reuses the existing onyx-cache container shared with Bayou. Keys are namespaced
+// under stockgal:* so we don't collide with Bayou's keys.
+const redis = new Redis(REDIS_URL, {
+  lazyConnect: true,
+  enableOfflineQueue: false,
+  maxRetriesPerRequest: 1,
+  retryStrategy: () => null, // give up immediately if redis is down
+});
+let redisOk = false;
+redis.connect()
+  .then(() => { redisOk = true; log("redis connected"); })
+  .catch(e => log(`redis connect failed: ${e.message}; running uncached`));
+redis.on("error", e => { /* swallow — already logged at connect; runtime errors handled inline */ });
+redis.on("ready", () => { redisOk = true; });
+redis.on("end",   () => { redisOk = false; });
+
+async function cached(key, ttl, fn) {
+  if (!redisOk) return fn();
+  try {
+    const hit = await redis.get(key);
+    if (hit) return JSON.parse(hit);
+  } catch {}
+  const fresh = await fn();
+  try { await redis.set(key, JSON.stringify(fresh), "EX", ttl); } catch {}
+  return fresh;
+}
+
+async function invalidateCache() {
+  if (!redisOk) return;
+  try {
+    await redis.del("stockgal:sidecars", "stockgal:tagindex");
+    // Wildcard delete the rendered HTML pages via SCAN
+    const stream = redis.scanStream({ match: "stockgal:html:*", count: 100 });
+    const keys = [];
+    for await (const batch of stream) keys.push(...batch);
+    if (keys.length) await redis.del(...keys);
+  } catch (e) { await log(`invalidateCache failed: ${e.message}`); }
+}
 
 async function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
@@ -267,6 +313,90 @@ async function enhancePrompt(rawPrompt, styleKey) {
   }
 }
 
+// ---------- Hashtag extraction ----------
+// Lowercase, alphanumerics + hyphens, must start with a letter, ≤30 chars
+function slugifyTag(s) {
+  const t = String(s || "").toLowerCase().trim()
+    .replace(/^#+/, "")
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return /^[a-z][a-z0-9-]{0,29}$/.test(t) ? t : "";
+}
+
+async function extractTags(rawPrompt, enhancedPrompt) {
+  const promptForTags = enhancedPrompt || rawPrompt;
+  const text = `Extract 1-5 short lowercase tags describing the main visual subjects of this image prompt. Output ONLY a comma-separated list. No '#', no quotes, no explanation. Each tag is one word or hyphenated, max 20 characters.
+
+Examples:
+- "a calico cat on a sunlit windowsill" → cat, windowsill, sunlight
+- "a vintage brass telescope on an oak desk" → telescope, brass, desk
+
+Prompt: ${promptForTags}`;
+  try {
+    const r = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: ENHANCE_MODEL,
+        prompt: text,
+        stream: false,
+        think: false,
+        keep_alive: "5m",
+        options: { temperature: 0.2, num_predict: 80 },
+      }),
+      signal: AbortSignal.timeout(TAGS_TIMEOUT_MS),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const cleaned = cleanLlmOutput(j.response || "");
+    const seen = new Set();
+    const tags = [];
+    for (const raw of cleaned.split(/[,\n]/)) {
+      const t = slugifyTag(raw);
+      if (t && !seen.has(t)) { seen.add(t); tags.push(t); if (tags.length >= 5) break; }
+    }
+    return tags;
+  } catch (e) {
+    await log(`extractTags failed: ${e.message}`);
+    return [];
+  }
+}
+
+// ---------- Pagination + filter ----------
+const UNTAGGED_TOKEN = "__untagged__";
+function paginateAndFilter(items, sidecars, { page, tag }) {
+  const filtered = !tag
+    ? items
+    : tag === UNTAGGED_TOKEN
+      ? items.filter(it => !(sidecars[it.name]?.tags?.length))
+      : items.filter(it => (sidecars[it.name]?.tags || []).includes(tag));
+  const totalCount = items.length;
+  const filteredCount = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(filteredCount / PAGE_SIZE));
+  const p = Math.min(Math.max(1, Number(page) || 1), totalPages);
+  const start = (p - 1) * PAGE_SIZE;
+  return {
+    pageItems: filtered.slice(start, start + PAGE_SIZE),
+    page: p, totalPages, totalCount, filteredCount, tag: tag || null,
+  };
+}
+
+function buildTagIndex(items, sidecars) {
+  const counts = new Map();
+  let untagged = 0;
+  for (const it of items) {
+    const meta = sidecars[it.name];
+    const tags = (meta?.tags || []).filter(t => typeof t === "string");
+    if (tags.length === 0) { untagged++; continue; }
+    for (const t of tags) counts.set(t, (counts.get(t) || 0) + 1);
+  }
+  return {
+    tags: [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([tag, count]) => ({ tag, count })),
+    untagged,
+    total: items.length,
+  };
+}
+
 // ---------- Sidecar JSON ----------
 function basenameNoExt(name) {
   return name.replace(/\.[^.]+$/, "");
@@ -387,7 +517,32 @@ async function upscaleOne(filename) {
   if (filename !== outName) {
     try { await unlink(inPath); } catch {}
   }
+  // Invalidate the cached thumbnail — old one was generated from the pre-upscale source
+  try {
+    const base = filename.replace(/\.[^.]+$/, "");
+    await unlink(path.join(GALLERY_DIR, ".thumbs", `${base}.webp`));
+  } catch {}
   return { input: filename, output: outName, bytes: webpBuf.length };
+}
+
+// ---------- Thumbnail subsystem ----------
+const THUMBS_DIR = path.join(GALLERY_DIR, ".thumbs");
+const THUMB_SIZE = 480;
+
+async function generateThumb(sourceName) {
+  const sourcePath = path.join(GALLERY_DIR, sourceName);
+  if (!existsSync(sourcePath)) throw new Error(`source not found: ${sourceName}`);
+  const base = sourceName.replace(/\.[^.]+$/, "");
+  const outPath = path.join(THUMBS_DIR, `${base}.webp`);
+  await mkdir(THUMBS_DIR, { recursive: true });
+  const buf = await sharp(sourcePath)
+    .resize(THUMB_SIZE, THUMB_SIZE, { fit: "cover", position: "attention" })
+    .webp({ quality: 75, effort: 4 })
+    .toBuffer();
+  const tmp = outPath + ".tmp";
+  await writeFile(tmp, buf);
+  await rename(tmp, outPath);
+  return outPath;
 }
 
 // ---------- Gen orchestration ----------
@@ -402,15 +557,24 @@ async function genOne({ enhancedPrompt, width, height, seed }) {
     height: Number(height),
   });
   const promptId = await comfyQueue(wf);
-  const buf = await comfyWaitImage(promptId);
-  const hash = createHashHex(buf);
-  const filename = `${hash}.png`;
+  const rawPng = await comfyWaitImage(promptId);
+
+  // WebP-by-default: gentle sharpen + WebP q90 so every gen is web-ready out of the box.
+  // 1024² PNG (~1.2MB) → WebP (~250KB), 768×1344 PNG (~1.5MB) → WebP (~150KB).
+  const webpBuf = await sharp(rawPng)
+    .sharpen({ sigma: 0.6 })
+    .webp({ quality: 90, effort: 5 })
+    .toBuffer();
+
+  // Hash the FINAL webp bytes — content-addressed by what's actually on disk
+  const hash = createHashHex(webpBuf);
+  const filename = `${hash}.webp`;
   await mkdir(GALLERY_DIR, { recursive: true });
   const tmp = path.join(GALLERY_DIR, `.${filename}.tmp`);
   const final = path.join(GALLERY_DIR, filename);
-  await writeFile(tmp, buf);
+  await writeFile(tmp, webpBuf);
   await rename(tmp, final);
-  return { filename, bytes: buf.length };
+  return { filename, bytes: webpBuf.length };
 }
 
 function createHashHex(buf) {
@@ -518,6 +682,9 @@ async function processJob(job) {
   job.enhancedPrompt = enhanced.text;
   job.enhanceFailed = !enhanced.enhanced && job.style !== "raw";
 
+  // 2b. Extract hashtags via the same LLM (best-effort, blank on failure)
+  job.tags = await extractTags(job.prompt, job.enhancedPrompt);
+
   // 3. Acquire GPU lock, stop Ollama, run N variations sequentially
   await acquireLock();
   try {
@@ -538,6 +705,7 @@ async function processJob(job) {
           enhancedPrompt: job.enhancedPrompt,
           enhanceFailed: job.enhanceFailed,
           style: job.style,
+          tags: job.tags,
           orientation: job.orientation,
           width: job.width,
           height: job.height,
@@ -559,6 +727,8 @@ async function processJob(job) {
   } finally {
     await startOllama();
     await releaseLock();
+    // Bust the cache so the next page render reflects new images + tags
+    invalidateCache().catch(() => {});
   }
 }
 
@@ -599,6 +769,8 @@ async function runUpscaleBatch(files) {
       } finally {
         await startOllama();
         await releaseLock();
+        // Bust the cache — upscaled files have new mtimes and replace originals
+        invalidateCache().catch(() => {});
       }
       currentJob.state = "done";
       currentJob.finished = Date.now();
@@ -616,7 +788,7 @@ async function runUpscaleBatch(files) {
 // ---------- HTML rendering ----------
 // Aesthetic: editorial dark archive. Fraunces serif display + JetBrains Mono
 // for technical metadata. Warm near-black with single vermillion accent.
-async function renderIndex(items) {
+async function renderIndex({ pageItems, page, totalPages, totalCount, filteredCount, tag, sidecars, tagIndex }) {
   const fmtTime = ms => {
     const d = new Date(ms);
     const yyyy = d.getUTCFullYear();
@@ -630,16 +802,14 @@ async function renderIndex(items) {
   const fmtKind = name => name.split(".").pop().toUpperCase();
   const truncate = (s, n) => s.length > n ? s.slice(0, n - 1) + "…" : s;
 
+  const items = pageItems;
   const totalBytes = items.reduce((a, s) => a + s.size, 0);
   const lastEntry = items[0];
 
-  // Bulk-load sidecars (Gap 7) — embedded as data attrs, no client roundtrips
-  const sidecars = await readAllSidecars(items);
-
   const tiles = items.length === 0
     ? `<div class="empty">
-         <p class="empty-quote">"The archive is empty."</p>
-         <p class="empty-hint">Compose the first image with the panel above ↑</p>
+         <p class="empty-quote">${tag ? `"No images for #${escapeHtml(tag)}."` : `"The archive is empty."`}</p>
+         <p class="empty-hint">${tag ? `<a href="/" class="empty-link">clear filter ↺</a>` : "Compose the first image with the panel above ↑"}</p>
        </div>`
     : items.map((s, i) => {
         const meta = sidecars[s.name] || null;
@@ -648,26 +818,67 @@ async function renderIndex(items) {
         const styleAttr = meta?.style ? ` data-style="${escapeHtml(meta.style)}"` : "";
         const seedAttr = meta?.seed !== undefined ? ` data-seed="${meta.seed}"` : "";
         const orientAttr = meta?.orientation ? ` data-orient="${escapeHtml(meta.orientation)}"` : "";
+        const tagsAttr = meta?.tags?.length ? ` data-tags="${escapeHtml(meta.tags.join(","))}"` : "";
         const promptLine = meta?.prompt
           ? `<span class="cap-prompt">${escapeHtml(truncate(meta.prompt, 80))}</span>`
           : "";
+        const tagLine = meta?.tags?.length
+          ? `<span class="cap-tags">${meta.tags.map(t => `#${escapeHtml(t)}`).join(" ")}</span>`
+          : "";
         return `
-    <figure class="tile" data-name="${escapeHtml(s.name)}"${promptAttr}${enhancedAttr}${styleAttr}${seedAttr}${orientAttr} style="--i:${i}">
+    <figure class="tile" data-name="${escapeHtml(s.name)}"${promptAttr}${enhancedAttr}${styleAttr}${seedAttr}${orientAttr}${tagsAttr} style="--i:${i}">
       <button class="select" type="button" aria-label="select ${escapeHtml(s.name)}" aria-pressed="false"></button>
-      <div class="tile-img"><img src="${escapeHtml(s.name)}" loading="lazy" alt="${escapeHtml(s.name)}"></div>
+      <div class="tile-img"><img src="thumb/${escapeHtml(s.name)}" loading="lazy" alt="${escapeHtml(s.name)}"></div>
       <figcaption>
         <span class="cap-kind">${escapeHtml(fmtKind(s.name))}${meta?.style ? ` · ${escapeHtml(meta.style)}` : ""}</span>
         <span class="cap-name">${escapeHtml(s.name.replace(/\.[^.]+$/, ""))}</span>
         ${promptLine}
+        ${tagLine}
         <span class="cap-meta">${fmtTime(s.mtime)} · ${fmtSize(s.size)}</span>
       </figcaption>
     </figure>`;
       }).join("");
 
-  // Style options for the dropdown
+  // Style options for the gen panel dropdown
   const styleOptions = Object.entries(STYLES)
     .map(([k, v]) => `<option value="${k}">${v.label}</option>`)
     .join("");
+
+  // Tag filter options for the masthead dropdown
+  const tagOptions = [
+    `<option value="">all images (${totalCount})</option>`,
+    ...(tagIndex?.tags || []).map(({ tag: t, count }) =>
+      `<option value="${escapeHtml(t)}"${tag === t ? " selected" : ""}>#${escapeHtml(t)} (${count})</option>`),
+    tagIndex?.untagged > 0
+      ? `<option value="${UNTAGGED_TOKEN}"${tag === UNTAGGED_TOKEN ? " selected" : ""}>— untagged (${tagIndex.untagged})</option>`
+      : "",
+  ].join("");
+
+  // Pagination controls — abbreviated when many pages: 1 2 [3] 4 ... 12
+  const pageHref = (n) => {
+    const params = new URLSearchParams();
+    if (tag) params.set("tag", tag);
+    if (n > 1) params.set("p", String(n));
+    const qs = params.toString();
+    return qs ? `/?${qs}` : "/";
+  };
+  const pageNumbers = (() => {
+    if (totalPages <= 7) return Array.from({length: totalPages}, (_, i) => i + 1);
+    const out = new Set([1, 2, totalPages - 1, totalPages, page - 1, page, page + 1]);
+    return [...out].filter(n => n >= 1 && n <= totalPages).sort((a, b) => a - b);
+  })();
+  const pagination = totalPages > 1
+    ? `<nav class="pagination">
+        ${page > 1 ? `<a class="pg-arrow" href="${pageHref(page - 1)}">‹ prev</a>` : `<span class="pg-arrow disabled">‹ prev</span>`}
+        ${pageNumbers.map((n, i) => {
+          const gap = i > 0 && pageNumbers[i] - pageNumbers[i - 1] > 1 ? `<span class="pg-gap">···</span>` : "";
+          return gap + (n === page
+            ? `<span class="pg-num current">${String(n).padStart(2, "0")}</span>`
+            : `<a class="pg-num" href="${pageHref(n)}">${String(n).padStart(2, "0")}</a>`);
+        }).join("")}
+        ${page < totalPages ? `<a class="pg-arrow" href="${pageHref(page + 1)}">next ›</a>` : `<span class="pg-arrow disabled">next ›</span>`}
+       </nav>`
+    : "";
 
   // SVG noise/grain for a paper-tactile background overlay
   const grain = `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)' opacity='0.42'/></svg>`;
@@ -813,7 +1024,26 @@ async function renderIndex(items) {
   .running .label { color: #5d574d; display: block; font-size: 9px; margin-bottom: 2px; }
   .running .val { color: var(--ink); }
 
+  .filter-cell { display: flex; flex-direction: column; gap: 4px; }
+  .tag-select-wrap { max-width: 200px; }
+  .tag-select-wrap select {
+    width: 100%;
+    appearance: none;
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 6px 24px 6px 8px;
+    cursor: pointer;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    outline: none;
+  }
+  .tag-select-wrap select:hover { border-color: var(--vermilion); }
+
   .hdr-queue { color: var(--vermilion); font-weight: 500; }
+  .of-total { color: var(--vermilion); font-size: 9px; }
 
   /* ─── Compose panel ─────────────────────────────────────────────── */
   .compose {
@@ -1078,6 +1308,62 @@ async function renderIndex(items) {
     -webkit-line-clamp: 2;
     -webkit-box-orient: vertical;
   }
+  .cap-tags {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--vermilion);
+    letter-spacing: 0.04em;
+    line-height: 1.4;
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* ─── Pagination ────────────────────────────────────────────────── */
+  .pagination {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    margin: 32px 0 8px;
+    font-family: var(--mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+  }
+  .pagination .pg-arrow,
+  .pagination .pg-num {
+    color: var(--ink-dim);
+    text-decoration: none;
+    padding: 8px 12px;
+    border: 1px solid var(--rule);
+    transition: all 140ms;
+  }
+  .pagination a:hover { color: var(--vermilion); border-color: var(--vermilion); }
+  .pagination .pg-num.current {
+    color: var(--paper);
+    background: var(--vermilion);
+    border-color: var(--vermilion);
+    font-weight: 500;
+  }
+  .pagination .pg-arrow.disabled { opacity: 0.3; pointer-events: none; }
+  .pagination .pg-gap { color: #5d574d; padding: 0 4px; }
+  @media (max-width: 720px) {
+    .pagination { gap: 4px; font-size: 10px; }
+    .pagination .pg-arrow, .pagination .pg-num { padding: 6px 10px; }
+  }
+
+  /* Empty-state link */
+  .empty-link {
+    display: inline-block;
+    margin-top: 8px;
+    color: var(--vermilion);
+    text-decoration: none;
+    border-bottom: 1px solid var(--vermilion);
+    padding-bottom: 1px;
+  }
+  .empty-link:hover { color: var(--ink); border-color: var(--ink); }
 
   @media (max-width: 720px) {
     .compose-row { gap: 14px; }
@@ -1357,6 +1643,26 @@ async function renderIndex(items) {
     max-width: 80vw;
   }
   .lightbox .lb-caption strong { color: var(--ink); font-weight: 400; }
+  .lightbox .lb-tags {
+    margin-top: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+  }
+  .lightbox .lb-tag {
+    color: var(--vermilion);
+    text-decoration: none;
+    padding: 4px 10px;
+    border: 1px solid var(--vermilion);
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: lowercase;
+    letter-spacing: 0.06em;
+    transition: all 140ms;
+    cursor: pointer;
+  }
+  .lightbox .lb-tag:hover { background: var(--vermilion); color: var(--paper); }
   .lightbox .lb-prompt {
     margin-top: 14px;
     font-family: var(--serif);
@@ -1412,8 +1718,8 @@ async function renderIndex(items) {
       <span class="mast-sub">a private catalog of generative imagery<br>z-image turbo · real-esrgan · sharp.js</span>
     </h1>
     <div class="meta-col">
-      <div><span class="num">${String(items.length).padStart(3, "0")}</span> / images</div>
-      <div>${(totalBytes / 1e6).toFixed(1)} MB</div>
+      <div><span class="num">${String(filteredCount).padStart(3, "0")}</span> / ${tag ? `#${escapeHtml(tag === UNTAGGED_TOKEN ? "untagged" : tag)}` : "images"}</div>
+      ${tag ? `<div class="of-total">of ${totalCount} total</div>` : `<div>${(totalBytes / 1e6).toFixed(1)} MB · page ${page}/${totalPages}</div>`}
       ${lastEntry ? `<div>last · ${escapeHtml(fmtTime(lastEntry.mtime))}</div>` : ""}
       <div class="hdr-queue" id="hdr-queue" style="display:none;">queue · <span id="hdr-queue-num">0</span></div>
       <div class="bar-count-label" id="hdr-selected" style="display:none;">— selected</div>
@@ -1422,7 +1728,12 @@ async function renderIndex(items) {
 
   <div class="running">
     <div><span class="label">Issue</span><span class="val">vol. 01</span></div>
-    <div><span class="label">Compiler</span><span class="val">comfy-mcp</span></div>
+    <div class="filter-cell">
+      <span class="label">Filter</span>
+      <div class="select-wrap tag-select-wrap">
+        <select id="tag-filter">${tagOptions}</select>
+      </div>
+    </div>
     <div><span class="label">Resolution</span><span class="val">1024² · 2048²</span></div>
     <div><span class="label">Origin</span><span class="val">silverwulf.com</span></div>
   </div>
@@ -1479,11 +1790,12 @@ async function renderIndex(items) {
 
   <main class="grid-wrap">
     <div class="grid">${tiles}</div>
+    ${pagination}
   </main>
 
   <footer>
     <div class="lhs">© silverwulf · <em>${fmtTime(Date.now())}</em></div>
-    <div class="rhs">no. ${String(items.length).padStart(4, "0")} · all images cc · click any tile to enlarge</div>
+    <div class="rhs">page ${page} of ${totalPages} · ${filteredCount} ${tag ? "filtered" : "total"} · all images cc · click any tile to enlarge</div>
   </footer>
 
   <div class="bar" id="bar">
@@ -1549,6 +1861,7 @@ async function renderIndex(items) {
         const style = tile.dataset.style || '';
         const seed = tile.dataset.seed || '';
         const orient = tile.dataset.orient || '';
+        const tags = (tile.dataset.tags || '').split(',').filter(Boolean);
         lightboxImg.src = name;
         lightboxImg.alt = name;
         const techLine = '<strong>' + name + '</strong>'
@@ -1557,7 +1870,10 @@ async function renderIndex(items) {
           + (seed ? '  ·  seed ' + seed : '')
           + '  ·  ' + cap.querySelector('.cap-meta').textContent;
         const promptLine = prompt ? '<div class="lb-prompt">"' + escapeHtmlClient(prompt) + '"</div>' : '';
-        lightboxCap.innerHTML = techLine + promptLine;
+        const tagLine = tags.length
+          ? '<div class="lb-tags">' + tags.map(t => '<a class="lb-tag" href="/?tag=' + encodeURIComponent(t) + '">#' + escapeHtmlClient(t) + '</a>').join(' ') + '</div>'
+          : '';
+        lightboxCap.innerHTML = techLine + promptLine + tagLine;
         lightbox.classList.add('open');
       });
     });
@@ -1624,6 +1940,15 @@ async function renderIndex(items) {
     });
 
     refreshBar();
+
+    // ─── Tag filter dropdown ────────────────────────────────────
+    const tagFilter = document.getElementById('tag-filter');
+    if (tagFilter) {
+      tagFilter.addEventListener('change', () => {
+        const v = tagFilter.value;
+        location.href = v ? '/?tag=' + encodeURIComponent(v) : '/';
+      });
+    }
 
     // ─── Compose ────────────────────────────────────────────────
     const cmpPrompt = document.getElementById('cmp-prompt');
@@ -1793,12 +2118,31 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const p = url.pathname;
 
-    // GET / → dynamic index
+    // GET / → dynamic index (paginated, optionally filtered)
     if (req.method === "GET" && p === "/") {
-      const items = await listGallery();
-      const html = await renderIndex(items);
+      const pageNum = Math.max(1, Number(url.searchParams.get("p")) || 1);
+      const tagFilter = url.searchParams.get("tag") || null;
+      // Cache key includes page + tag, only for the first 4 pages of unfiltered or the most common filter views
+      const cacheKey = `stockgal:html:p${pageNum}:t${tagFilter || ""}`;
+      const html = await cached(cacheKey, CACHE_HTML_TTL, async () => {
+        const items = await listGallery();
+        const sidecars = await cached("stockgal:sidecars", CACHE_TTL_SECONDS, () => readAllSidecars(items));
+        const tagIndex = await cached("stockgal:tagindex", CACHE_TTL_SECONDS, async () => buildTagIndex(items, sidecars));
+        const pagination = paginateAndFilter(items, sidecars, { page: pageNum, tag: tagFilter });
+        return await renderIndex({ ...pagination, sidecars, tagIndex });
+      });
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache, must-revalidate" });
       res.end(html);
+      return;
+    }
+
+    // GET /api/tags → tag index for the filter dropdown
+    if (req.method === "GET" && p === "/api/tags") {
+      const items = await listGallery();
+      const sidecars = await cached("stockgal:sidecars", CACHE_TTL_SECONDS, () => readAllSidecars(items));
+      const idx = await cached("stockgal:tagindex", CACHE_TTL_SECONDS, async () => buildTagIndex(items, sidecars));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(idx));
       return;
     }
 
@@ -1897,6 +2241,26 @@ const server = http.createServer(async (req, res) => {
         zip.append(createReadStream(path.join(GALLERY_DIR, f)), { name: f });
       }
       await zip.finalize();
+      return;
+    }
+
+    // GET /thumb/<file> → lazy-generated 480² WebP thumbnail
+    if (req.method === "GET" && p.startsWith("/thumb/")) {
+      const name = decodeURIComponent(p.slice("/thumb/".length));
+      if (!safeFilename(name)) { res.writeHead(404); res.end(); return; }
+      const base = name.replace(/\.[^.]+$/, "");
+      const thumbPath = path.join(THUMBS_DIR, `${base}.webp`);
+      if (!existsSync(thumbPath)) {
+        try { await generateThumb(name); }
+        catch (e) { await log(`thumb gen failed for ${name}: ${e.message}`); res.writeHead(404); res.end(); return; }
+      }
+      const s = await stat(thumbPath);
+      res.writeHead(200, {
+        "content-type": "image/webp",
+        "content-length": s.size,
+        "cache-control": "public, max-age=31536000, immutable",
+      });
+      createReadStream(thumbPath).pipe(res);
       return;
     }
 

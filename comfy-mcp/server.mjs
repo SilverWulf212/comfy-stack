@@ -22,6 +22,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import Docker from "dockerode";
+import sharp from "sharp";
 import { readFile, writeFile, rename, unlink, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { createHash, randomInt } from "node:crypto";
@@ -274,17 +275,25 @@ async function generateImage(args) {
     await log(`queueing workflow=${workflow_name} style=${style} ${width}x${height} seed=${seed}`);
     const promptId = await comfyQueue(workflow);
     await log(`prompt_id=${promptId}, polling...`);
-    const { buf } = await comfyWaitAndGetImage(promptId);
-    await log(`got image ${buf.length} bytes`);
+    const { buf: rawPng } = await comfyWaitAndGetImage(promptId);
+    await log(`got image ${rawPng.length} bytes (raw png)`);
 
-    const hash = createHash("sha256").update(buf).digest("hex").slice(0, 16);
-    const key = `${hash}.png`;
-    await saveToGallery(buf, key);
+    // Sharp post-process: gentle sharpen + WebP q90, web-ready by default
+    const webpBuf = await sharp(rawPng)
+      .sharpen({ sigma: 0.6 })
+      .webp({ quality: 90, effort: 5 })
+      .toBuffer();
+    await log(`encoded webp ${webpBuf.length} bytes (${Math.round(100 - 100 * webpBuf.length / rawPng.length)}% smaller)`);
+
+    const hash = createHash("sha256").update(webpBuf).digest("hex").slice(0, 16);
+    const key = `${hash}.webp`;
+    await saveToGallery(webpBuf, key);
     await writeSidecar(key, {
       prompt,
       enhancedPrompt: prompt,    // comfy-mcp doesn't run the LLM rewriter
       enhanceFailed: false,
       style,
+      tags: [],                  // comfy-mcp path leaves tags empty (no LLM extraction here)
       orientation: effectiveOrient,
       width,
       height,

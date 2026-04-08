@@ -7,5 +7,6 @@ gallery/*.jpeg
 gallery/*.webp
 gallery/*.json
 gallery/index.html
+gallery/.thumbs/
 .env
 .DS_Store
