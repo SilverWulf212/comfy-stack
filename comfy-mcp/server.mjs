@@ -198,14 +198,32 @@ async function saveToGallery(buf, key) {
   await rename(tmp, final);
 }
 
+// Sidecar JSON next to the image (Gap 8 — symmetric with stock-gallery)
+async function writeSidecar(filename, meta) {
+  const base = filename.replace(/\.[^.]+$/, "");
+  const final = path.join(GALLERY_DIR, `${base}.json`);
+  const tmp = path.join(GALLERY_DIR, `.${base}.json.tmp`);
+  await writeFile(tmp, JSON.stringify(meta, null, 2));
+  await rename(tmp, final);
+}
+
+// Orientation presets for the MCP tool
+const ORIENTATIONS = {
+  square:    { width: 1024, height: 1024 },
+  landscape: { width: 1344, height: 768  },
+  portrait:  { width: 768,  height: 1344 },
+};
+
 // ---------- Main pipeline ----------
 async function generateImage(args) {
   const {
     prompt,
     negative_prompt = "blurry, ugly, bad",
-    style = "zimage-default",
-    width = 1024,
-    height = 1024,
+    workflow_name = "zimage-default",
+    style = "raw",            // metadata only — comfy-mcp does NOT call the LLM rewriter
+    orientation,              // optional: if set, overrides width/height
+    width: explicitWidth,
+    height: explicitHeight,
     steps = 9,
     cfg = 1.0,
     seed = randomInt(0, 2 ** 31 - 1),
@@ -214,6 +232,18 @@ async function generateImage(args) {
   if (!prompt || typeof prompt !== "string") {
     throw new Error("prompt is required (non-empty string)");
   }
+
+  // Resolve dimensions: orientation preset wins over explicit width/height
+  let width = 1024, height = 1024;
+  if (orientation && ORIENTATIONS[orientation]) {
+    width = ORIENTATIONS[orientation].width;
+    height = ORIENTATIONS[orientation].height;
+  } else if (explicitWidth || explicitHeight) {
+    width = Number(explicitWidth) || 1024;
+    height = Number(explicitHeight) || 1024;
+  }
+  const effectiveOrient = orientation
+    || (width === height ? "square" : width > height ? "landscape" : "portrait");
 
   await acquireLock();
   let url = null;
@@ -231,7 +261,7 @@ async function generateImage(args) {
     }
     if (!comfyReady) throw new Error(`ComfyUI not reachable at ${COMFY_URL}`);
 
-    const workflowTemplate = await loadWorkflow(style);
+    const workflowTemplate = await loadWorkflow(workflow_name);
     const workflow = deepReplace(workflowTemplate, {
       prompt, negative_prompt,
       seed: Number(seed),
@@ -241,7 +271,7 @@ async function generateImage(args) {
       height: Number(height),
     });
 
-    await log(`queueing workflow style=${style} steps=${steps} ${width}x${height} seed=${seed}`);
+    await log(`queueing workflow=${workflow_name} style=${style} ${width}x${height} seed=${seed}`);
     const promptId = await comfyQueue(workflow);
     await log(`prompt_id=${promptId}, polling...`);
     const { buf } = await comfyWaitAndGetImage(promptId);
@@ -250,6 +280,21 @@ async function generateImage(args) {
     const hash = createHash("sha256").update(buf).digest("hex").slice(0, 16);
     const key = `${hash}.png`;
     await saveToGallery(buf, key);
+    await writeSidecar(key, {
+      prompt,
+      enhancedPrompt: prompt,    // comfy-mcp doesn't run the LLM rewriter
+      enhanceFailed: false,
+      style,
+      orientation: effectiveOrient,
+      width,
+      height,
+      steps,
+      cfg,
+      seed,
+      model: "z-image-turbo Q5_K_M",
+      createdAt: new Date().toISOString(),
+      source: "comfy-mcp",
+    });
     url = `${PUBLIC_BASE_URL}/${key}`;
     await log(`saved -> ${url}`);
   } finally {
@@ -257,7 +302,7 @@ async function generateImage(args) {
     await releaseLock();
   }
 
-  return { url, prompt, style, width, height, steps, seed };
+  return { url, prompt, style, orientation: effectiveOrient, width, height, steps, seed };
 }
 
 // ---------- MCP server boilerplate ----------
@@ -271,17 +316,20 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "generate_image",
       description:
-        "Generate a 1024x1024 (default) image from a text prompt using Z-Image Turbo on the local RTX 4060. " +
-        "Stops local Ollama for the duration of the job, runs the workflow in ComfyUI, uploads to MinIO, " +
-        "and returns a public URL at https://images.silverwulf.work/<hash>.png. Takes ~10-30s per image.",
+        "Generate an image from a text prompt using Z-Image Turbo on the local RTX 4060. " +
+        "Stops local Ollama for the duration of the job, runs the workflow in ComfyUI, " +
+        "saves to the shared gallery folder with a sidecar metadata JSON, and returns a public URL " +
+        "at https://stock.silverwulf.com/<hash>.png. Takes ~10-30s per image.",
       inputSchema: {
         type: "object",
         properties: {
           prompt:          { type: "string", description: "Text prompt describing the image" },
           negative_prompt: { type: "string", description: "Things to avoid (default: 'blurry, ugly, bad')" },
-          style:           { type: "string", description: "Workflow name from /workflows/*.json (default: zimage-default)" },
-          width:           { type: "integer", description: "Width in px (default 1024, multiple of 64)" },
-          height:          { type: "integer", description: "Height in px (default 1024, multiple of 64)" },
+          style:           { type: "string", enum: ["raw", "photo", "editorial", "cinematic", "illustration", "product"], description: "Style label stored in metadata sidecar (does NOT trigger LLM rewrite — that's only available via the stock-gallery web UI). Default: raw." },
+          orientation:     { type: "string", enum: ["square", "landscape", "portrait"], description: "Orientation preset. square=1024², landscape=1344x768 (16:9), portrait=768x1344 (9:16). Overrides explicit width/height. Default: square." },
+          workflow_name:   { type: "string", description: "Workflow JSON file under /workflows (default: zimage-default). Use this to swap to a different model entirely." },
+          width:           { type: "integer", description: "Width in px (default 1024, multiple of 64). Ignored if orientation is set." },
+          height:          { type: "integer", description: "Height in px (default 1024, multiple of 64). Ignored if orientation is set." },
           steps:           { type: "integer", description: "Sampling steps (default 9, range 6-12)" },
           cfg:             { type: "number",  description: "Classifier-free guidance (default 1.0; turbo models use ~1)" },
           seed:            { type: "integer", description: "RNG seed (default: random)" },

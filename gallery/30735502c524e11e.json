@@ -1,0 +1,15 @@
+{
+  "prompt": "a single ceramic teapot",
+  "enhancedPrompt": "a single ceramic teapot, studio product photography, soft seamless background, even diffuse lighting, accurate materials and textures, subject-centered",
+  "enhanceFailed": false,
+  "style": "product",
+  "orientation": "square",
+  "width": 1024,
+  "height": 1024,
+  "steps": 9,
+  "cfg": 1,
+  "seed": 552181044,
+  "model": "z-image-turbo Q5_K_M",
+  "createdAt": "2026-04-08T13:21:35.157Z",
+  "jobId": 1775654447699
+}

@@ -1,0 +1,15 @@
+{
+  "prompt": "a brass key on velvet",
+  "enhancedPrompt": "A brass key resting on a plush velvet surface, studio product photography, soft seamless background, even diffuse lighting, accurate metallic and fabric textures, subject-centered, high detail, 8k.",
+  "enhanceFailed": false,
+  "style": "product",
+  "orientation": "square",
+  "width": 1024,
+  "height": 1024,
+  "steps": 9,
+  "cfg": 1,
+  "seed": 2133474122,
+  "model": "z-image-turbo Q5_K_M",
+  "createdAt": "2026-04-08T13:50:55.334Z",
+  "jobId": 1775656154710
+}

@@ -24,6 +24,7 @@ import { readFile, writeFile, rename, unlink, mkdir, readdir, stat } from "node:
 import { existsSync, createReadStream } from "node:fs";
 import { setTimeout as sleep } from "node:timers/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 import sharp from "sharp";
 import Docker from "dockerode";
 import archiver from "archiver";
@@ -39,9 +40,66 @@ const OLLAMA_CONTAINERS = (process.env.OLLAMA_CONTAINERS || "ollama").split(",")
 const OLLAMA_URL = process.env.OLLAMA_URL || "http://ollama:11434";
 const WARM_GEN_MODELS   = (process.env.WARM_GEN_MODELS   || "qwen3.5:9b,qwen3.5:4b").split(",").map(s => s.trim()).filter(Boolean);
 const WARM_EMBED_MODELS = (process.env.WARM_EMBED_MODELS || "nomic-embed-text").split(",").map(s => s.trim()).filter(Boolean);
+const ENHANCE_MODEL   = process.env.ENHANCE_MODEL || "qwen3.5:4b";
 
 const POLL_INTERVAL_MS = 1000;
 const POLL_TIMEOUT_MS  = 5 * 60 * 1000;
+const MAX_QUEUE        = 16;
+const MAX_PROMPT_LEN   = 1000;
+const ENHANCE_TIMEOUT_MS = 30_000;
+
+// ---------- Styles ----------
+// NOTE: the {{prompt}} placeholder here is consumed by enhancePrompt(), NOT by deepReplace().
+// They operate on different layers (string templating vs ComfyUI workflow JSON) and never collide.
+const STYLES = {
+  raw: {
+    label: "raw",
+    description: "no rewrite — your prompt verbatim",
+    template: null,
+  },
+  photo: {
+    label: "photo",
+    description: "photorealistic, natural lighting, lens-aware",
+    template: `You are a prompt engineer for an AI image model. Rewrite the user's image prompt to enforce a photorealistic style: natural lighting, shallow depth of field, lens-aware composition, real-world materials and shadows. Keep the subject and composition intact — do not add or remove subjects. Output ONLY the rewritten prompt. No quotes, no preamble, no explanation.
+
+User prompt: {{prompt}}`,
+  },
+  editorial: {
+    label: "editorial",
+    description: "high-end magazine, dramatic composition",
+    template: `You are a prompt engineer for an AI image model. Rewrite the user's image prompt to enforce a high-end editorial magazine aesthetic: dramatic composition, sophisticated color grading, considered framing, subject-forward. Keep the subject intact — do not add or remove subjects. Output ONLY the rewritten prompt. No quotes, no preamble, no explanation.
+
+User prompt: {{prompt}}`,
+  },
+  cinematic: {
+    label: "cinematic",
+    description: "film still, anamorphic, atmospheric",
+    template: `You are a prompt engineer for an AI image model. Rewrite the user's image prompt to enforce a cinematic film-still aesthetic: anamorphic framing, atmospheric lighting, color graded for emotional tone, slight film grain. Keep the subject intact — do not add or remove subjects. Output ONLY the rewritten prompt. No quotes, no preamble, no explanation.
+
+User prompt: {{prompt}}`,
+  },
+  illustration: {
+    label: "illustration",
+    description: "digital painting, expressive brushwork",
+    template: `You are a prompt engineer for an AI image model. Rewrite the user's image prompt to enforce a digital illustration style: expressive brushwork, rich color palette, painterly textures, considered light direction. Keep the subject intact — do not add or remove subjects. Output ONLY the rewritten prompt. No quotes, no preamble, no explanation.
+
+User prompt: {{prompt}}`,
+  },
+  product: {
+    label: "product",
+    description: "studio product shot, soft seamless background",
+    template: `You are a prompt engineer for an AI image model. Rewrite the user's image prompt to enforce a studio product photography style: soft seamless background, even diffuse lighting, accurate materials and textures, subject-centered. Keep the subject intact — do not add or remove subjects. Output ONLY the rewritten prompt. No quotes, no preamble, no explanation.
+
+User prompt: {{prompt}}`,
+  },
+};
+
+// ---------- Orientations ----------
+const ORIENTATIONS = {
+  square:    { label: "square",    width: 1024, height: 1024 },
+  landscape: { label: "landscape", width: 1344, height: 768  },  // 16:9-ish, multiples of 64
+  portrait:  { label: "portrait",  width: 768,  height: 1344 },
+};
 
 // ---------- Utilities ----------
 const docker = new Docker({ socketPath: "/var/run/docker.sock" });
@@ -132,8 +190,15 @@ async function startOllama() {
 }
 
 // ---------- ComfyUI workflow helpers ----------
+// IMPORTANT: if the entire string is a single placeholder (e.g. "{{width}}"),
+// return the raw value (preserves Number type for EmptySD3LatentImage et al).
+// Otherwise interpolate as a string. comfy-mcp uses an identical impl.
 function deepReplace(node, vars) {
   if (typeof node === "string") {
+    if (/^\{\{(\w+)\}\}$/.test(node)) {
+      const k = node.match(/^\{\{(\w+)\}\}$/)[1];
+      return vars[k] !== undefined ? vars[k] : node;
+    }
     return node.replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] !== undefined ? String(vars[k]) : `{{${k}}}`));
   }
   if (Array.isArray(node)) return node.map(n => deepReplace(n, vars));
@@ -146,6 +211,92 @@ function deepReplace(node, vars) {
     return out;
   }
   return node;
+}
+
+// ---------- LLM enhancement ----------
+// Strip common LLM output cruft: <think> blocks (for reasoning models),
+// surrounding quotes, "Here is..." preambles, markdown fences, multi-paragraph drift.
+function cleanLlmOutput(s) {
+  if (typeof s !== "string") return "";
+  let out = s;
+  // Strip <think>...</think> blocks (qwen3.5 reasoning model output)
+  out = out.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  // Strip orphaned think tags if the closing tag is missing
+  out = out.replace(/<\/?think>/gi, "");
+  out = out.trim();
+  // Strip code fences
+  out = out.replace(/^```[a-z]*\n?/i, "").replace(/\n?```$/i, "").trim();
+  // Drop common preambles
+  out = out.replace(/^(here(?:'s| is)?\s+(?:the\s+)?(?:rewritten|new|updated|enhanced|improved)?\s*prompt[:\-]?\s*)/i, "");
+  out = out.replace(/^(rewritten\s+prompt[:\-]?\s*)/i, "");
+  // Take first paragraph
+  out = out.split(/\n{2,}/)[0];
+  // Strip surrounding quotes (single, double, smart)
+  out = out.trim().replace(/^["'\u201c\u2018]+|["'\u201d\u2019]+$/g, "").trim();
+  // Cap length
+  if (out.length > 1500) out = out.slice(0, 1500);
+  return out;
+}
+
+async function enhancePrompt(rawPrompt, styleKey) {
+  const style = STYLES[styleKey];
+  if (!style || !style.template) return { text: rawPrompt, enhanced: false };
+  const filled = style.template.replace(/\{\{prompt\}\}/g, rawPrompt);
+  try {
+    const r = await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: ENHANCE_MODEL,
+        prompt: filled,
+        stream: false,
+        think: false,            // qwen3.5 reasoning models — disable thinking tokens
+        keep_alive: "5m",
+        options: { temperature: 0.4, num_predict: 400 },
+      }),
+      signal: AbortSignal.timeout(ENHANCE_TIMEOUT_MS),
+    });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const j = await r.json();
+    const cleaned = cleanLlmOutput(j.response || "");
+    if (!cleaned) throw new Error("empty after cleanup");
+    return { text: cleaned, enhanced: true };
+  } catch (e) {
+    await log(`enhancePrompt(${styleKey}) failed, falling back to raw: ${e.message}`);
+    return { text: rawPrompt, enhanced: false, enhanceError: e.message };
+  }
+}
+
+// ---------- Sidecar JSON ----------
+function basenameNoExt(name) {
+  return name.replace(/\.[^.]+$/, "");
+}
+
+async function writeSidecar(filename, meta) {
+  const base = basenameNoExt(filename);
+  const final = path.join(GALLERY_DIR, `${base}.json`);
+  const tmp = path.join(GALLERY_DIR, `.${base}.json.tmp`);
+  await writeFile(tmp, JSON.stringify(meta, null, 2));
+  await rename(tmp, final);
+}
+
+async function readSidecar(filename) {
+  try {
+    const fp = path.join(GALLERY_DIR, `${basenameNoExt(filename)}.json`);
+    const raw = await readFile(fp, "utf8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function readAllSidecars(items) {
+  const out = {};
+  await Promise.all(items.map(async it => {
+    const meta = await readSidecar(it.name);
+    if (meta) out[it.name] = meta;
+  }));
+  return out;
 }
 
 async function loadWorkflow(name) {
@@ -239,6 +390,182 @@ async function upscaleOne(filename) {
   return { input: filename, output: outName, bytes: webpBuf.length };
 }
 
+// ---------- Gen orchestration ----------
+async function genOne({ enhancedPrompt, width, height, seed }) {
+  const wf = deepReplace(await loadWorkflow("zimage-default"), {
+    prompt: enhancedPrompt,
+    negative_prompt: "blurry, ugly, bad",
+    seed: Number(seed),
+    steps: 9,
+    cfg: 1.0,
+    width: Number(width),
+    height: Number(height),
+  });
+  const promptId = await comfyQueue(wf);
+  const buf = await comfyWaitImage(promptId);
+  const hash = createHashHex(buf);
+  const filename = `${hash}.png`;
+  await mkdir(GALLERY_DIR, { recursive: true });
+  const tmp = path.join(GALLERY_DIR, `.${filename}.tmp`);
+  const final = path.join(GALLERY_DIR, filename);
+  await writeFile(tmp, buf);
+  await rename(tmp, final);
+  return { filename, bytes: buf.length };
+}
+
+function createHashHex(buf) {
+  // 16-char sha prefix, matching the existing scheme
+  return crypto.createHash("sha256").update(buf).digest("hex").slice(0, 16);
+}
+
+// ---------- Queue (single worker, deferred wake) ----------
+const queue = [];
+const finishedHistory = []; // last few completed/cancelled jobs for UI display
+let runningJob = null;
+let workerWake = () => {};
+let workerStarted = false;
+
+function enqueueJob(spec) {
+  // Cancelled jobs still occupy queue slots until the worker shifts them out;
+  // exclude them from the cap so cancellation actually frees up capacity.
+  const activePending = queue.filter(j => j.state !== "cancelled").length;
+  if (activePending >= MAX_QUEUE) {
+    const e = new Error(`queue full (${MAX_QUEUE} pending)`);
+    e.code = 429;
+    throw e;
+  }
+  const job = {
+    id: Date.now() + Math.floor(Math.random() * 1000),
+    state: "pending",
+    prompt: spec.prompt,
+    enhancedPrompt: null,
+    enhanceFailed: false,
+    style: spec.style,
+    orientation: spec.orientation,
+    variations: spec.variations,
+    width: ORIENTATIONS[spec.orientation].width,
+    height: ORIENTATIONS[spec.orientation].height,
+    done: 0,
+    results: [],
+    errors: [],
+    submittedAt: Date.now(),
+  };
+  queue.push(job);
+  workerWake();
+  return job;
+}
+
+async function recoverStaleLock() {
+  // If we own a stale lock from a previous (crashed/killed) instance, clear it
+  // and bring Ollama back up. The lock contents include our owner string.
+  try {
+    if (!existsSync(LOCK_FILE)) return;
+    const contents = await readFile(LOCK_FILE, "utf8").catch(() => "");
+    if (contents.includes("stock-gallery")) {
+      await log(`recovering stale lock: ${contents.trim()}`);
+      await unlink(LOCK_FILE).catch(() => {});
+      await startOllama();
+    }
+  } catch (e) {
+    await log(`recoverStaleLock error: ${e.message}`);
+  }
+}
+
+function startWorker() {
+  if (workerStarted) return;
+  workerStarted = true;
+  recoverStaleLock().catch(e => log(`recover error: ${e.message}`));
+  (async function worker() {
+    while (true) {
+      if (queue.length === 0) {
+        await new Promise(r => (workerWake = r));
+        continue;
+      }
+      const job = queue.shift();
+      if (job.state === "cancelled") {
+        finishedHistory.unshift(job);
+        finishedHistory.length = Math.min(finishedHistory.length, 10);
+        continue;
+      }
+      runningJob = job;
+      try {
+        await processJob(job);
+        job.state = "done";
+        job.finishedAt = Date.now();
+      } catch (e) {
+        await log(`job ${job.id} fatal: ${e.stack || e.message}`);
+        job.state = "error";
+        job.fatalError = e.message;
+        job.finishedAt = Date.now();
+      } finally {
+        runningJob = null;
+        finishedHistory.unshift(job);
+        finishedHistory.length = Math.min(finishedHistory.length, 10);
+      }
+    }
+  })().catch(e => log(`worker crashed: ${e.stack || e.message}`));
+}
+
+async function processJob(job) {
+  // 1. Wait for the lock to be free so Ollama is up for the enhance call
+  job.state = "enhancing";
+  for (let i = 0; i < 60; i++) {
+    if (!existsSync(LOCK_FILE)) break;
+    await sleep(1000);
+  }
+  // 2. Enhance prompt (may fall through to raw)
+  const enhanced = await enhancePrompt(job.prompt, job.style);
+  job.enhancedPrompt = enhanced.text;
+  job.enhanceFailed = !enhanced.enhanced && job.style !== "raw";
+
+  // 3. Acquire GPU lock, stop Ollama, run N variations sequentially
+  await acquireLock();
+  try {
+    await stopOllama();
+    job.state = "running";
+    for (let i = 0; i < job.variations; i++) {
+      job.currentVariation = i + 1;
+      const seed = randomInt32();
+      try {
+        const result = await genOne({
+          enhancedPrompt: job.enhancedPrompt,
+          width: job.width,
+          height: job.height,
+          seed,
+        });
+        await writeSidecar(result.filename, {
+          prompt: job.prompt,
+          enhancedPrompt: job.enhancedPrompt,
+          enhanceFailed: job.enhanceFailed,
+          style: job.style,
+          orientation: job.orientation,
+          width: job.width,
+          height: job.height,
+          steps: 9,
+          cfg: 1.0,
+          seed,
+          model: "z-image-turbo Q5_K_M",
+          createdAt: new Date().toISOString(),
+          jobId: job.id,
+        });
+        job.results.push({ filename: result.filename, seed });
+        await log(`gen ${job.id}.${i + 1}/${job.variations} -> ${result.filename}`);
+      } catch (e) {
+        job.errors.push({ variation: i + 1, error: e.message });
+        await log(`gen ${job.id}.${i + 1} failed: ${e.message}`);
+      }
+      job.done++;
+    }
+  } finally {
+    await startOllama();
+    await releaseLock();
+  }
+}
+
+function randomInt32() {
+  return Math.floor(Math.random() * 0x7fffffff);
+}
+
 // ---------- Job state (single in-memory job) ----------
 let currentJob = null;
 async function runUpscaleBatch(files) {
@@ -289,7 +616,7 @@ async function runUpscaleBatch(files) {
 // ---------- HTML rendering ----------
 // Aesthetic: editorial dark archive. Fraunces serif display + JetBrains Mono
 // for technical metadata. Warm near-black with single vermillion accent.
-function renderIndex(items) {
+async function renderIndex(items) {
   const fmtTime = ms => {
     const d = new Date(ms);
     const yyyy = d.getUTCFullYear();
@@ -301,25 +628,46 @@ function renderIndex(items) {
   };
   const fmtSize = b => b > 1e6 ? `${(b / 1e6).toFixed(1)}MB` : `${(b / 1e3).toFixed(0)}KB`;
   const fmtKind = name => name.split(".").pop().toUpperCase();
+  const truncate = (s, n) => s.length > n ? s.slice(0, n - 1) + "…" : s;
 
   const totalBytes = items.reduce((a, s) => a + s.size, 0);
   const lastEntry = items[0];
 
+  // Bulk-load sidecars (Gap 7) — embedded as data attrs, no client roundtrips
+  const sidecars = await readAllSidecars(items);
+
   const tiles = items.length === 0
     ? `<div class="empty">
          <p class="empty-quote">"The archive is empty."</p>
-         <p class="empty-hint">Generate the first image with the <code>generate_image</code> MCP tool.</p>
+         <p class="empty-hint">Compose the first image with the panel above ↑</p>
        </div>`
-    : items.map((s, i) => `
-    <figure class="tile" data-name="${escapeHtml(s.name)}" style="--i:${i}">
+    : items.map((s, i) => {
+        const meta = sidecars[s.name] || null;
+        const promptAttr = meta?.prompt ? ` data-prompt="${escapeHtml(meta.prompt)}"` : "";
+        const enhancedAttr = meta?.enhancedPrompt ? ` data-enhanced="${escapeHtml(meta.enhancedPrompt)}"` : "";
+        const styleAttr = meta?.style ? ` data-style="${escapeHtml(meta.style)}"` : "";
+        const seedAttr = meta?.seed !== undefined ? ` data-seed="${meta.seed}"` : "";
+        const orientAttr = meta?.orientation ? ` data-orient="${escapeHtml(meta.orientation)}"` : "";
+        const promptLine = meta?.prompt
+          ? `<span class="cap-prompt">${escapeHtml(truncate(meta.prompt, 80))}</span>`
+          : "";
+        return `
+    <figure class="tile" data-name="${escapeHtml(s.name)}"${promptAttr}${enhancedAttr}${styleAttr}${seedAttr}${orientAttr} style="--i:${i}">
       <button class="select" type="button" aria-label="select ${escapeHtml(s.name)}" aria-pressed="false"></button>
       <div class="tile-img"><img src="${escapeHtml(s.name)}" loading="lazy" alt="${escapeHtml(s.name)}"></div>
       <figcaption>
-        <span class="cap-kind">${escapeHtml(fmtKind(s.name))}</span>
+        <span class="cap-kind">${escapeHtml(fmtKind(s.name))}${meta?.style ? ` · ${escapeHtml(meta.style)}` : ""}</span>
         <span class="cap-name">${escapeHtml(s.name.replace(/\.[^.]+$/, ""))}</span>
+        ${promptLine}
         <span class="cap-meta">${fmtTime(s.mtime)} · ${fmtSize(s.size)}</span>
       </figcaption>
-    </figure>`).join("");
+    </figure>`;
+      }).join("");
+
+  // Style options for the dropdown
+  const styleOptions = Object.entries(STYLES)
+    .map(([k, v]) => `<option value="${k}">${v.label}</option>`)
+    .join("");
 
   // SVG noise/grain for a paper-tactile background overlay
   const grain = `data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.55 0'/></filter><rect width='100%' height='100%' filter='url(%23n)' opacity='0.42'/></svg>`;
@@ -419,15 +767,16 @@ function renderIndex(items) {
   .mast-sub {
     display: block;
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 10.5px;
     font-weight: 400;
-    letter-spacing: 0.18em;
+    line-height: 1.7;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
     color: var(--ink-dim);
-    margin-top: 14px;
-    padding-top: 10px;
+    margin-top: 16px;
+    padding-top: 12px;
     border-top: 1px solid var(--rule);
-    max-width: 420px;
+    max-width: 460px;
   }
   .meta-col {
     display: flex;
@@ -463,6 +812,277 @@ function renderIndex(items) {
   .running > div { padding-right: 16px; }
   .running .label { color: #5d574d; display: block; font-size: 9px; margin-bottom: 2px; }
   .running .val { color: var(--ink); }
+
+  .hdr-queue { color: var(--vermilion); font-weight: 500; }
+
+  /* ─── Compose panel ─────────────────────────────────────────────── */
+  .compose {
+    margin: 0 40px;
+    border: 1px solid var(--rule);
+    border-top: none;
+    background: rgba(20,18,15,0.5);
+  }
+  @media (max-width: 720px) { .compose { margin: 0 20px; } }
+  .compose-head {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .compose-label {
+    font-family: var(--serif);
+    font-size: 18px;
+    font-weight: 400;
+    font-style: italic;
+    color: var(--ink);
+    letter-spacing: -0.01em;
+  }
+  .compose-hint {
+    flex: 1;
+    font-family: var(--mono);
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--ink-dim);
+  }
+  .compose-toggle {
+    background: none;
+    border: 0;
+    color: var(--ink-dim);
+    font-size: 18px;
+    cursor: pointer;
+    padding: 4px 8px;
+    transition: transform 200ms ease, color 140ms;
+  }
+  .compose-toggle:hover { color: var(--vermilion); }
+  .compose.collapsed .compose-toggle { transform: rotate(-90deg); }
+  .compose.collapsed .compose-body { display: none; }
+  .compose-body { padding: 18px; }
+  .compose-body textarea {
+    width: 100%;
+    min-height: 56px;
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 12px 14px;
+    line-height: 1.55;
+    resize: vertical;
+    outline: none;
+    transition: border-color 140ms;
+  }
+  .compose-body textarea:focus { border-color: var(--vermilion); }
+  .compose-body textarea::placeholder { color: var(--ink-dim); font-style: italic; }
+  .compose-row {
+    display: flex;
+    align-items: flex-end;
+    gap: 24px;
+    margin-top: 16px;
+    flex-wrap: wrap;
+  }
+  .ctrl { display: flex; flex-direction: column; gap: 6px; }
+  .ctrl-label {
+    font-family: var(--mono);
+    font-size: 9px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: #5d574d;
+  }
+  .select-wrap { position: relative; }
+  .select-wrap::after {
+    content: "▾";
+    position: absolute;
+    right: 12px; top: 50%;
+    transform: translateY(-50%);
+    color: var(--ink-dim);
+    pointer-events: none;
+    font-size: 10px;
+  }
+  .compose-body select {
+    appearance: none;
+    background: var(--paper);
+    border: 1px solid var(--rule);
+    color: var(--ink);
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 8px 28px 8px 12px;
+    cursor: pointer;
+    text-transform: lowercase;
+    letter-spacing: 0.04em;
+    min-width: 140px;
+    outline: none;
+  }
+  .compose-body select:focus { border-color: var(--vermilion); }
+  .seg { display: flex; border: 1px solid var(--rule); }
+  .seg-btn {
+    background: var(--paper);
+    color: var(--ink-dim);
+    border: 0;
+    border-right: 1px solid var(--rule);
+    padding: 8px 14px;
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    cursor: pointer;
+    transition: all 140ms;
+  }
+  .seg-btn:last-child { border-right: 0; }
+  .seg-btn:hover { color: var(--ink); }
+  .seg-btn.active { background: var(--vermilion); color: var(--paper); }
+  .seg-num .seg-btn { min-width: 42px; }
+  .compose-spacer { flex: 1; }
+  .char-count {
+    font-family: var(--mono);
+    font-size: 9px;
+    color: var(--ink-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    align-self: center;
+  }
+  .compose-submit {
+    background: var(--vermilion);
+    color: var(--paper);
+    border: 1px solid var(--vermilion);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    padding: 12px 22px;
+    cursor: pointer;
+    transition: all 140ms;
+  }
+  .compose-submit:hover {
+    background: var(--paper);
+    color: var(--vermilion);
+  }
+  .compose-submit:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* ─── Queue panel ───────────────────────────────────────────────── */
+  .queue-panel {
+    margin: 0 40px;
+    border: 1px solid var(--rule);
+    border-top: none;
+    background: rgba(20,18,15,0.5);
+  }
+  @media (max-width: 720px) { .queue-panel { margin: 0 20px; } }
+  .queue-head {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 12px 18px;
+    cursor: pointer;
+  }
+  .queue-label {
+    font-family: var(--serif);
+    font-style: italic;
+    font-size: 16px;
+    color: var(--vermilion);
+  }
+  .queue-counts {
+    flex: 1;
+    font-family: var(--mono);
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--ink-dim);
+  }
+  .queue-toggle {
+    background: none; border: 0; color: var(--ink-dim);
+    font-size: 18px; cursor: pointer; padding: 4px 8px;
+    transition: transform 200ms ease;
+  }
+  .queue-panel.expanded .queue-toggle { transform: rotate(180deg); }
+  .queue-body { padding: 0 18px 18px; display: flex; flex-direction: column; gap: 10px; }
+  .queue-body[hidden] { display: none; }
+  .qjob {
+    border-left: 2px solid var(--rule);
+    padding: 10px 14px;
+    background: var(--paper);
+  }
+  .qjob.running { border-left-color: var(--vermilion); }
+  .qjob.cancelled { opacity: 0.4; }
+  .qjob-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    font-family: var(--mono);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--ink-dim);
+    margin-bottom: 6px;
+  }
+  .qjob-state { color: var(--vermilion); font-weight: 500; }
+  .qjob-meta { color: #5d574d; }
+  .qjob-spacer { flex: 1; }
+  .qjob-cancel {
+    background: none;
+    border: 1px solid var(--rule);
+    color: var(--ink-dim);
+    font-family: var(--mono);
+    font-size: 9px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    padding: 4px 8px;
+    cursor: pointer;
+  }
+  .qjob-cancel:hover { color: var(--vermilion); border-color: var(--vermilion); }
+  .qjob-prompt {
+    font-family: var(--serif);
+    font-size: 14px;
+    color: var(--ink);
+    line-height: 1.45;
+    margin-bottom: 4px;
+  }
+  .qjob-enhanced {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-dim);
+    line-height: 1.5;
+    border-top: 1px dotted var(--rule);
+    padding-top: 6px;
+    margin-top: 4px;
+  }
+  .qjob-enhanced::before {
+    content: "→ ";
+    color: var(--vermilion);
+  }
+  .qjob-progress {
+    margin-top: 8px;
+    display: flex;
+    gap: 3px;
+    align-items: center;
+  }
+  .qjob-progress .pip {
+    width: 14px; height: 4px;
+    background: var(--rule);
+  }
+  .qjob-progress .pip.done { background: var(--vermilion); }
+
+  /* Tile prompt caption line */
+  .cap-prompt {
+    font-family: var(--serif);
+    font-style: italic;
+    font-size: 11.5px;
+    color: var(--ink);
+    line-height: 1.4;
+    margin: 4px 0 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+
+  @media (max-width: 720px) {
+    .compose-row { gap: 14px; }
+    .compose.mobile-collapsed .compose-body { display: none; }
+  }
 
   /* ─── Grid ────────────────────────────────────────────────────────── */
   .grid-wrap { padding: 28px 40px 0; }
@@ -737,6 +1357,17 @@ function renderIndex(items) {
     max-width: 80vw;
   }
   .lightbox .lb-caption strong { color: var(--ink); font-weight: 400; }
+  .lightbox .lb-prompt {
+    margin-top: 14px;
+    font-family: var(--serif);
+    font-style: italic;
+    font-size: 16px;
+    line-height: 1.5;
+    color: var(--ink);
+    text-transform: none;
+    letter-spacing: 0.005em;
+    max-width: 80vw;
+  }
   .lightbox .close {
     position: absolute;
     top: 24px;
@@ -778,12 +1409,13 @@ function renderIndex(items) {
 <body>
   <header>
     <h1 class="mast">stock<em>·</em>archive
-      <span class="mast-sub">A private catalog of generative imagery — z-image turbo on rtx 4060, post-processed via real-esrgan + sharp.js</span>
+      <span class="mast-sub">a private catalog of generative imagery<br>z-image turbo · real-esrgan · sharp.js</span>
     </h1>
     <div class="meta-col">
       <div><span class="num">${String(items.length).padStart(3, "0")}</span> / images</div>
       <div>${(totalBytes / 1e6).toFixed(1)} MB</div>
       ${lastEntry ? `<div>last · ${escapeHtml(fmtTime(lastEntry.mtime))}</div>` : ""}
+      <div class="hdr-queue" id="hdr-queue" style="display:none;">queue · <span id="hdr-queue-num">0</span></div>
       <div class="bar-count-label" id="hdr-selected" style="display:none;">— selected</div>
     </div>
   </header>
@@ -794,6 +1426,56 @@ function renderIndex(items) {
     <div><span class="label">Resolution</span><span class="val">1024² · 2048²</span></div>
     <div><span class="label">Origin</span><span class="val">silverwulf.com</span></div>
   </div>
+
+  <!-- ─── Compose panel ────────────────────────────────────────────── -->
+  <section class="compose" id="compose">
+    <div class="compose-head">
+      <span class="compose-label">Compose</span>
+      <span class="compose-hint">describe a subject · q3.5:4b enhances per style</span>
+      <button class="compose-toggle" id="compose-toggle" type="button" aria-label="toggle">▾</button>
+    </div>
+    <div class="compose-body">
+      <textarea id="cmp-prompt" placeholder="describe an image…" maxlength="${MAX_PROMPT_LEN}" rows="2"></textarea>
+      <div class="compose-row">
+        <label class="ctrl">
+          <span class="ctrl-label">Style</span>
+          <div class="select-wrap">
+            <select id="cmp-style">${styleOptions}</select>
+          </div>
+        </label>
+        <label class="ctrl">
+          <span class="ctrl-label">Orient</span>
+          <div class="seg" role="group">
+            <button class="seg-btn" data-orient="square" type="button">square</button>
+            <button class="seg-btn active" data-orient="landscape" type="button">landscape</button>
+            <button class="seg-btn" data-orient="portrait" type="button">portrait</button>
+          </div>
+        </label>
+        <label class="ctrl">
+          <span class="ctrl-label">Vars</span>
+          <div class="seg seg-num" role="group">
+            <button class="seg-btn active" data-var="1" type="button">01</button>
+            <button class="seg-btn" data-var="2" type="button">02</button>
+            <button class="seg-btn" data-var="3" type="button">03</button>
+            <button class="seg-btn" data-var="4" type="button">04</button>
+          </div>
+        </label>
+        <div class="compose-spacer"></div>
+        <span class="char-count" id="char-count">0 / ${MAX_PROMPT_LEN}</span>
+        <button class="primary compose-submit" id="cmp-submit" type="button">Queue →</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── Queue panel (collapsible) ─────────────────────────────────── -->
+  <section class="queue-panel" id="queue-panel" style="display:none;">
+    <div class="queue-head">
+      <span class="queue-label">Queue</span>
+      <span class="queue-counts" id="queue-counts">— pending · — running</span>
+      <button class="queue-toggle" id="queue-toggle" type="button" aria-label="expand">▾</button>
+    </div>
+    <div class="queue-body" id="queue-body" hidden></div>
+  </section>
 
   <main class="grid-wrap">
     <div class="grid">${tiles}</div>
@@ -863,12 +1545,25 @@ function renderIndex(items) {
         if (e.target === cb) return;
         const name = tile.dataset.name;
         const cap = tile.querySelector('figcaption');
+        const prompt = tile.dataset.prompt || '';
+        const style = tile.dataset.style || '';
+        const seed = tile.dataset.seed || '';
+        const orient = tile.dataset.orient || '';
         lightboxImg.src = name;
         lightboxImg.alt = name;
-        lightboxCap.innerHTML = '<strong>' + name + '</strong>  ·  ' + cap.querySelector('.cap-meta').textContent;
+        const techLine = '<strong>' + name + '</strong>'
+          + (style ? '  ·  ' + style.toUpperCase() : '')
+          + (orient ? '  ·  ' + orient.toUpperCase() : '')
+          + (seed ? '  ·  seed ' + seed : '')
+          + '  ·  ' + cap.querySelector('.cap-meta').textContent;
+        const promptLine = prompt ? '<div class="lb-prompt">"' + escapeHtmlClient(prompt) + '"</div>' : '';
+        lightboxCap.innerHTML = techLine + promptLine;
         lightbox.classList.add('open');
       });
     });
+    function escapeHtmlClient(s) {
+      const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
+    }
     lightbox.addEventListener('click', () => lightbox.classList.remove('open'));
     document.addEventListener('keydown', e => { if (e.key === 'Escape') lightbox.classList.remove('open'); });
 
@@ -929,6 +1624,153 @@ function renderIndex(items) {
     });
 
     refreshBar();
+
+    // ─── Compose ────────────────────────────────────────────────
+    const cmpPrompt = document.getElementById('cmp-prompt');
+    const cmpStyle = document.getElementById('cmp-style');
+    const cmpSubmit = document.getElementById('cmp-submit');
+    const charCount = document.getElementById('char-count');
+    const compose = document.getElementById('compose');
+    const composeToggle = document.getElementById('compose-toggle');
+    const orientButtons = compose.querySelectorAll('[data-orient]');
+    const varButtons = compose.querySelectorAll('[data-var]');
+    const MAX_LEN = ${MAX_PROMPT_LEN};
+    let curOrient = 'landscape';
+    let curVars = 1;
+
+    cmpPrompt.addEventListener('input', () => {
+      charCount.textContent = cmpPrompt.value.length + ' / ' + MAX_LEN;
+    });
+    orientButtons.forEach(b => b.addEventListener('click', () => {
+      orientButtons.forEach(o => o.classList.remove('active'));
+      b.classList.add('active');
+      curOrient = b.dataset.orient;
+    }));
+    varButtons.forEach(b => b.addEventListener('click', () => {
+      varButtons.forEach(o => o.classList.remove('active'));
+      b.classList.add('active');
+      curVars = Number(b.dataset.var);
+    }));
+    composeToggle.addEventListener('click', () => compose.classList.toggle('collapsed'));
+    // Mobile: collapse by default
+    if (window.matchMedia('(max-width: 720px)').matches) compose.classList.add('collapsed');
+
+    cmpSubmit.addEventListener('click', async () => {
+      const prompt = cmpPrompt.value.trim();
+      if (!prompt) return;
+      cmpSubmit.disabled = true;
+      try {
+        const r = await fetch('/api/generate', {
+          method: 'POST', headers: {'content-type':'application/json'},
+          body: JSON.stringify({ prompt, style: cmpStyle.value, orientation: curOrient, variations: curVars }),
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          alert('queue failed (' + r.status + '): ' + txt);
+        } else {
+          cmpPrompt.value = '';
+          charCount.textContent = '0 / ' + MAX_LEN;
+          startPolling();
+        }
+      } catch (e) { alert('queue failed: ' + e.message); }
+      finally { cmpSubmit.disabled = false; }
+    });
+    cmpPrompt.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); cmpSubmit.click(); }
+    });
+
+    // ─── Queue panel + polling ───────────────────────────────────
+    const queuePanel = document.getElementById('queue-panel');
+    const queueBody = document.getElementById('queue-body');
+    const queueCounts = document.getElementById('queue-counts');
+    const queueToggle = document.getElementById('queue-toggle');
+    const queueHead = queuePanel.querySelector('.queue-head');
+    const hdrQueue = document.getElementById('hdr-queue');
+    const hdrQueueNum = document.getElementById('hdr-queue-num');
+    let queueExpanded = false;
+    let pollHandle = null;
+    let lastFinishedTs = Date.now();
+
+    queueHead.addEventListener('click', () => {
+      queueExpanded = !queueExpanded;
+      queuePanel.classList.toggle('expanded', queueExpanded);
+      queueBody.hidden = !queueExpanded;
+    });
+
+    function renderQueue(state) {
+      const running = state.running ? [state.running] : [];
+      const all = running.concat(state.pending || []);
+      // Header counts
+      const pendN = (state.pending || []).length;
+      const runN = state.running ? 1 : 0;
+      queueCounts.textContent =
+        String(pendN).padStart(2,'0') + ' pending · ' + (runN ? '01' : '00') + ' running';
+      // Visibility
+      const total = pendN + runN;
+      queuePanel.style.display = total > 0 ? 'block' : 'none';
+      hdrQueue.style.display = total > 0 ? 'block' : 'none';
+      hdrQueueNum.textContent = String(total).padStart(2,'0');
+      // Body
+      queueBody.innerHTML = all.map(j => {
+        const isRunning = j.state === 'running' || j.state === 'enhancing';
+        const pips = Array.from({length: j.variations}, (_, i) =>
+          '<span class="pip ' + (i < (j.done || 0) ? 'done' : '') + '"></span>'
+        ).join('');
+        return '<div class="qjob ' + (isRunning ? 'running' : '') + '">'
+          + '<div class="qjob-head">'
+          +   '<span class="qjob-state">' + (j.state || '').toUpperCase() + '</span>'
+          +   '<span class="qjob-meta">' + (j.style||'') + ' · ' + (j.orientation||'') + ' · ' + (j.variations||1) + 'x</span>'
+          +   '<span class="qjob-spacer"></span>'
+          +   (j.state === 'pending'
+                ? '<button class="qjob-cancel" data-cancel-id="' + j.id + '">cancel</button>'
+                : '')
+          + '</div>'
+          + '<div class="qjob-prompt">' + escapeHtmlClient(j.prompt || '') + '</div>'
+          + (j.enhancedPrompt && j.enhancedPrompt !== j.prompt
+              ? '<div class="qjob-enhanced">' + escapeHtmlClient(j.enhancedPrompt) + '</div>'
+              : '')
+          + (isRunning ? '<div class="qjob-progress">' + pips + '</div>' : '')
+          + '</div>';
+      }).join('');
+      // Wire cancel buttons
+      queueBody.querySelectorAll('[data-cancel-id]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const id = btn.dataset.cancelId;
+          await fetch('/api/queue/' + id, { method: 'DELETE' });
+        });
+      });
+    }
+
+    async function pollQueue() {
+      try {
+        const r = await fetch('/api/queue');
+        if (!r.ok) return;
+        const s = await r.json();
+        renderQueue(s);
+        const empty = !s.running && (!s.pending || s.pending.length === 0);
+        // Did the most recent finished happen after this page loaded? → reload
+        const lastFin = (s.finished || []).find(j => j.state === 'done' || j.state === 'error');
+        if (empty && lastFin && lastFin.finishedAt > lastFinishedTs) {
+          stopPolling();
+          setTimeout(() => location.reload(), 400);
+          return;
+        }
+        if (empty) stopPolling();
+      } catch (e) { /* ignore transient */ }
+    }
+    function startPolling() {
+      if (pollHandle) return;
+      lastFinishedTs = Date.now();
+      pollQueue();
+      pollHandle = setInterval(pollQueue, 1500);
+    }
+    function stopPolling() {
+      if (pollHandle) { clearInterval(pollHandle); pollHandle = null; }
+    }
+    // On load: start polling if queue is non-empty
+    pollQueue().then(() => {
+      if (queuePanel.style.display === 'block') startPolling();
+    });
   })();
   </script>
 </body>
@@ -954,7 +1796,7 @@ const server = http.createServer(async (req, res) => {
     // GET / → dynamic index
     if (req.method === "GET" && p === "/") {
       const items = await listGallery();
-      const html = renderIndex(items);
+      const html = await renderIndex(items);
       res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache, must-revalidate" });
       res.end(html);
       return;
@@ -964,6 +1806,66 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && p === "/api/upscale/status") {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(currentJob || { state: "idle" }));
+      return;
+    }
+
+    // GET /api/styles → list of style options for the dropdown
+    if (req.method === "GET" && p === "/api/styles") {
+      const out = Object.entries(STYLES).map(([k, v]) => ({ key: k, label: v.label, description: v.description }));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(out));
+      return;
+    }
+
+    // GET /api/queue → {running, pending, finishedHistory}
+    if (req.method === "GET" && p === "/api/queue") {
+      const summarize = j => j && {
+        id: j.id, state: j.state, prompt: j.prompt, enhancedPrompt: j.enhancedPrompt,
+        enhanceFailed: j.enhanceFailed, style: j.style, orientation: j.orientation,
+        variations: j.variations, done: j.done, currentVariation: j.currentVariation,
+        results: j.results, errors: j.errors, submittedAt: j.submittedAt, finishedAt: j.finishedAt,
+        fatalError: j.fatalError,
+      };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        running: summarize(runningJob),
+        pending: queue.map(summarize),
+        finished: finishedHistory.slice(0, 5).map(summarize),
+      }));
+      return;
+    }
+
+    // POST /api/generate {prompt, style, variations, orientation}
+    if (req.method === "POST" && p === "/api/generate") {
+      let body;
+      try { body = await readJsonBody(req); } catch (e) { res.writeHead(400); res.end("invalid json"); return; }
+      const prompt = String(body.prompt || "").trim();
+      const style = String(body.style || "raw");
+      const orientation = String(body.orientation || "square");
+      const variations = Math.min(4, Math.max(1, Number(body.variations) || 1));
+      if (!prompt) { res.writeHead(400); res.end("prompt required"); return; }
+      if (prompt.length > MAX_PROMPT_LEN) { res.writeHead(400); res.end(`prompt > ${MAX_PROMPT_LEN} chars`); return; }
+      if (!STYLES[style]) { res.writeHead(400); res.end(`unknown style: ${style}`); return; }
+      if (!ORIENTATIONS[orientation]) { res.writeHead(400); res.end(`unknown orientation: ${orientation}`); return; }
+      try {
+        const job = enqueueJob({ prompt, style, orientation, variations });
+        res.writeHead(202, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id: job.id, position: queue.length }));
+      } catch (e) {
+        res.writeHead(e.code || 500); res.end(e.message);
+      }
+      return;
+    }
+
+    // DELETE /api/queue/:id → mark cancelled (worker drops on shift)
+    if (req.method === "DELETE" && /^\/api\/queue\/\d+$/.test(p)) {
+      const id = Number(p.split("/").pop());
+      const j = queue.find(x => x.id === id);
+      if (!j) { res.writeHead(404); res.end("not found in pending queue"); return; }
+      if (j.state !== "pending") { res.writeHead(409); res.end("job already started"); return; }
+      j.state = "cancelled";
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id, state: "cancelled" }));
       return;
     }
 
@@ -1024,4 +1926,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => log(`stock-gallery listening on :${PORT}`));
+server.listen(PORT, () => {
+  log(`stock-gallery listening on :${PORT}`);
+  startWorker();
+});

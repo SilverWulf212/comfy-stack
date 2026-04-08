@@ -1,0 +1,15 @@
+{
+  "prompt": "a single tree on a windswept ridge",
+  "enhancedPrompt": "a single tree on a windswept ridge",
+  "enhanceFailed": true,
+  "style": "photo",
+  "orientation": "landscape",
+  "width": 1344,
+  "height": 768,
+  "steps": 9,
+  "cfg": 1,
+  "seed": 1094952286,
+  "model": "z-image-turbo Q5_K_M",
+  "createdAt": "2026-04-08T13:15:18.183Z",
+  "jobId": 1775654061235
+}
