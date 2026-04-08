@@ -1,0 +1,9 @@
+{
+  "name": "stock-gallery-e2e",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@playwright/test": "1.49.0"
+  }
+}
