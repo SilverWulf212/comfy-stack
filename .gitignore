@@ -5,6 +5,7 @@ gallery/*.png
 gallery/*.jpg
 gallery/*.jpeg
 gallery/*.webp
+gallery/*.json
 gallery/index.html
 .env
 .DS_Store
