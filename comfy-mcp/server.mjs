@@ -55,7 +55,9 @@ async function acquireLock() {
   await mkdir(path.dirname(LOCK_FILE), { recursive: true });
   for (let i = 0; i < 60; i++) {
     if (!existsSync(LOCK_FILE)) {
-      await writeFile(LOCK_FILE, `${process.pid} ${new Date().toISOString()}`);
+      // Tag the lock with our owner string so stock-gallery's reaper can identify
+      // an orphaned comfy-mcp lock if this ephemeral process is SIGKILLed mid-job.
+      await writeFile(LOCK_FILE, `${process.pid} comfy-mcp ${new Date().toISOString()}`);
       return;
     }
     await sleep(1000);

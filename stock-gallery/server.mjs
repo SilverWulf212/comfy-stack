@@ -619,16 +619,43 @@ function enqueueJob(spec) {
   return job;
 }
 
+// Maximum age (ms) for a lock to be considered "live" by an unknown owner.
+// Anything older than this on stock-gallery startup is reaped regardless of owner.
+// Math: longest single op = 5 min ComfyUI poll timeout + 60s warmup buffer = 6 min.
+const STALE_LOCK_MAX_AGE_MS = 6 * 60 * 1000;
+
 async function recoverStaleLock() {
-  // If we own a stale lock from a previous (crashed/killed) instance, clear it
-  // and bring Ollama back up. The lock contents include our owner string.
+  // Two recovery paths:
+  //  1. We OWN the lock (stock-gallery substring) → unconditional reap on boot,
+  //     because if we're booting we crashed mid-job by definition.
+  //  2. Someone ELSE owns it (e.g. comfy-mcp SIGKILLed mid-job) → reap if mtime
+  //     is older than STALE_LOCK_MAX_AGE_MS. This breaks the comfy-mcp deadlock
+  //     scenario where the cron watchdog refuses to restart Ollama while a
+  //     stale lock exists.
   try {
     if (!existsSync(LOCK_FILE)) return;
     const contents = await readFile(LOCK_FILE, "utf8").catch(() => "");
-    if (contents.includes("stock-gallery")) {
-      await log(`recovering stale lock: ${contents.trim()}`);
+    const owner = contents.includes("stock-gallery") ? "stock-gallery"
+                : contents.includes("comfy-mcp")     ? "comfy-mcp"
+                : "unknown";
+
+    if (owner === "stock-gallery") {
+      await log(`recovering own stale lock: ${contents.trim()}`);
       await unlink(LOCK_FILE).catch(() => {});
       await startOllama();
+      return;
+    }
+
+    // Foreign owner: only reap if older than the safety threshold
+    const lockStat = await stat(LOCK_FILE).catch(() => null);
+    if (!lockStat) return;
+    const ageMs = Date.now() - lockStat.mtimeMs;
+    if (ageMs > STALE_LOCK_MAX_AGE_MS) {
+      await log(`reaping stale ${owner} lock (age=${Math.round(ageMs/1000)}s, threshold=${STALE_LOCK_MAX_AGE_MS/1000}s): ${contents.trim()}`);
+      await unlink(LOCK_FILE).catch(() => {});
+      await startOllama();
+    } else {
+      await log(`leaving live ${owner} lock alone (age=${Math.round(ageMs/1000)}s)`);
     }
   } catch (e) {
     await log(`recoverStaleLock error: ${e.message}`);
