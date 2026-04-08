@@ -2140,7 +2140,44 @@ async function readJsonBody(req) {
   });
 }
 
+// Always-fresh headers — applied to JSON API responses and the dynamic HTML page.
+// `no-store` is stronger than `no-cache, must-revalidate`: it forbids browsers AND
+// intermediaries from storing the response at all. Critical for the polling JS that
+// hits /api/queue every 1.5s — without no-store, browsers can apply heuristic
+// caching and the queue UI freezes on a stale "running" state, breaking the
+// auto-reload-on-completion behavior. (Found 2026-04-08 during a UX diagnosis.)
+const JSON_HEADERS_NOSTORE = {
+  "content-type": "application/json",
+  "cache-control": "no-store, must-revalidate",
+  "pragma": "no-cache",
+  "expires": "0",
+};
+const HTML_HEADERS_NOSTORE = {
+  "content-type": "text/html; charset=utf-8",
+  "cache-control": "no-store, must-revalidate",
+  "pragma": "no-cache",
+  "expires": "0",
+};
+
+// HTTP access log — fires per request after the handler completes.
+// Logs method, URL, status, response time, and remote IP (via Cloudflare-Connecting-IP).
+// Goes to /state/stock-gallery.log via the existing log() helper plus stderr.
+function accessLog(req, res, status, ms) {
+  const ip = req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "?";
+  const ua = (req.headers["user-agent"] || "?").slice(0, 60);
+  log(`${req.method} ${req.url} ${status} ${ms}ms ip=${ip} ua="${ua}"`).catch(() => {});
+}
+
 const server = http.createServer(async (req, res) => {
+  const reqStart = Date.now();
+  // Wrap res.writeHead so accessLog fires automatically with whatever status the handler chose.
+  const origWriteHead = res.writeHead.bind(res);
+  let loggedStatus = null;
+  res.writeHead = function (status, ...rest) {
+    loggedStatus = status;
+    return origWriteHead(status, ...rest);
+  };
+  res.on("finish", () => accessLog(req, res, loggedStatus || res.statusCode, Date.now() - reqStart));
   try {
     const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
     const p = url.pathname;
@@ -2158,7 +2195,7 @@ const server = http.createServer(async (req, res) => {
         const pagination = paginateAndFilter(items, sidecars, { page: pageNum, tag: tagFilter });
         return await renderIndex({ ...pagination, sidecars, tagIndex });
       });
-      res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache, must-revalidate" });
+      res.writeHead(200, HTML_HEADERS_NOSTORE);
       res.end(html);
       return;
     }
@@ -2168,14 +2205,14 @@ const server = http.createServer(async (req, res) => {
       const items = await listGallery();
       const sidecars = await cached("stockgal:sidecars", CACHE_TTL_SECONDS, () => readAllSidecars(items));
       const idx = await cached("stockgal:tagindex", CACHE_TTL_SECONDS, async () => buildTagIndex(items, sidecars));
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(200, JSON_HEADERS_NOSTORE);
       res.end(JSON.stringify(idx));
       return;
     }
 
     // GET /api/upscale/status
     if (req.method === "GET" && p === "/api/upscale/status") {
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(200, JSON_HEADERS_NOSTORE);
       res.end(JSON.stringify(currentJob || { state: "idle" }));
       return;
     }
@@ -2183,7 +2220,7 @@ const server = http.createServer(async (req, res) => {
     // GET /api/styles → list of style options for the dropdown
     if (req.method === "GET" && p === "/api/styles") {
       const out = Object.entries(STYLES).map(([k, v]) => ({ key: k, label: v.label, description: v.description }));
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(200, JSON_HEADERS_NOSTORE);
       res.end(JSON.stringify(out));
       return;
     }
@@ -2197,7 +2234,7 @@ const server = http.createServer(async (req, res) => {
         results: j.results, errors: j.errors, submittedAt: j.submittedAt, finishedAt: j.finishedAt,
         fatalError: j.fatalError,
       };
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(200, JSON_HEADERS_NOSTORE);
       res.end(JSON.stringify({
         running: summarize(runningJob),
         pending: queue.map(summarize),
@@ -2220,7 +2257,7 @@ const server = http.createServer(async (req, res) => {
       if (!ORIENTATIONS[orientation]) { res.writeHead(400); res.end(`unknown orientation: ${orientation}`); return; }
       try {
         const job = enqueueJob({ prompt, style, orientation, variations });
-        res.writeHead(202, { "content-type": "application/json" });
+        res.writeHead(202, JSON_HEADERS_NOSTORE);
         res.end(JSON.stringify({ id: job.id, position: queue.length }));
       } catch (e) {
         res.writeHead(e.code || 500); res.end(e.message);
@@ -2235,7 +2272,7 @@ const server = http.createServer(async (req, res) => {
       if (!j) { res.writeHead(404); res.end("not found in pending queue"); return; }
       if (j.state !== "pending") { res.writeHead(409); res.end("job already started"); return; }
       j.state = "cancelled";
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(200, JSON_HEADERS_NOSTORE);
       res.end(JSON.stringify({ id, state: "cancelled" }));
       return;
     }
@@ -2247,7 +2284,7 @@ const server = http.createServer(async (req, res) => {
       if (!files.length) { res.writeHead(400); res.end("no valid files"); return; }
       const job = await runUpscaleBatch(files).catch(e => ({ error: e.message }));
       if (job.error) { res.writeHead(409); res.end(job.error); return; }
-      res.writeHead(202, { "content-type": "application/json" });
+      res.writeHead(202, JSON_HEADERS_NOSTORE);
       res.end(JSON.stringify({ id: job.id, total: job.total }));
       return;
     }
