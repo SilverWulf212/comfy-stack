@@ -117,7 +117,36 @@ docker run -d --name stock-gallery --restart unless-stopped --network ollamawulf
 
 ## Testing
 
-There are **no unit tests on disk**. Testing is a runbook of curl + docker commands documented in the plan file at `/home/silverwulf/.claude/plans/mellow-prancing-boole.md`. The most useful commands:
+The authoritative test runner is the **Playwright e2e suite** at `tests/e2e/stock-gallery.spec.mjs` (added 2026-04-08, commit `3b774b5`). Real headless Chromium against the live container on the `ollamawulf` Docker network. **7 tests, 7/7 must pass before any v3+ commit.**
+
+```bash
+# Full suite (cheap tests + the gen+reload regression — ~1.4 min, triggers ONE real GPU gen)
+docker run --rm --network ollamawulf \
+  -v /home/silverwulf/comfy-stack/tests/e2e:/test -w /test \
+  mcr.microsoft.com/playwright:v1.49.0-jammy \
+  sh -c "npm install --silent && npx playwright test --reporter=list"
+
+# Cheap tests only (no GPU, ~7 s) — for fast iteration
+docker run --rm --network ollamawulf \
+  -v /home/silverwulf/comfy-stack/tests/e2e:/test -w /test \
+  mcr.microsoft.com/playwright:v1.49.0-jammy \
+  sh -c "npx playwright test --reporter=list --grep 'page loads|cache headers|clicking a tile|tag filter|bayou'"
+```
+
+What the suite covers:
+1. Page loads with all UI elements (compose / queue / lightbox / dropdown / grid)
+2. Cache headers are `no-store` on `/api/*` and `/` (regression for the polling-freeze bug)
+3. Clicking a tile opens the lightbox with prompt visible
+4. Tag filter actually filters and updates the count
+5. **Submit gen → queue panel → auto-reload → new tile** (THE BIG ONE — ~75 s, real GPU)
+6. Lightbox of the freshly-generated tile shows prompt + tags
+7. Bayou regression (chats normally after our gen stop/restarted Ollama)
+
+**`@playwright/test` is pinned to `1.49.0`** in `tests/e2e/package.json` to match the docker image. Mismatch breaks the bundled chromium binary.
+
+Treat the suite as a living regression bed: every new feature gets a new `test()` block before it merges. Curl probes are still useful for things Playwright doesn't cover (XSS via crafted sidecars, JSON bombs, lock-file inspection), but they are **supplementary**, not authoritative.
+
+### Supplementary curl probes
 
 ```bash
 # Smoke a gen end to end
@@ -125,7 +154,7 @@ curl -s -X POST -H "content-type: application/json" -H "Host: stock.silverwulf.c
   -d '{"prompt":"a cat","style":"photo","orientation":"square","variations":1}' \
   http://localhost/api/generate
 
-# Watch the queue
+# Watch the queue (now includes the access log line per request — see below)
 curl -s -H "Host: stock.silverwulf.com" http://localhost/api/queue | python3 -m json.tool
 
 # Bayou regression (ensures the Ollama cycle didn't break the other tenant)
@@ -141,7 +170,17 @@ cat /home/silverwulf/comfy-stack/state/comfy-gpu.lock 2>&1 || echo "(absent — 
 
 # Redis state
 docker exec onyx-cache redis-cli KEYS "stockgal:*"
+
+# HTTP access log (added 2026-04-08) — per-request, includes IP, method, URL, status, ms
+docker logs stock-gallery 2>&1 | tail -30
+tail -50 /home/silverwulf/comfy-stack/state/stock-gallery.log
 ```
+
+### Browser cache contracts: a cautionary tale
+
+`stock-gallery` sends `Cache-Control: no-store, must-revalidate` + `Pragma: no-cache` + `Expires: 0` on EVERY `/api/*` JSON response and the dynamic `/` HTML page (`JSON_HEADERS_NOSTORE` / `HTML_HEADERS_NOSTORE` constants in `server.mjs`). **Do not weaken these.** A previous version sent only `no-cache, must-revalidate` on `/` and NO cache headers on `/api/queue` — the polling JS that polls every 1.5 s during a gen got served stale "running" responses from the browser's heuristic cache, the `setTimeout(() => location.reload(), 400)` never fired because the polling never saw `state: "done"`, and the user saw the queue UI freeze forever. The bug was invisible to curl-based smoke tests and only caught by a real-browser Playwright test.
+
+If you ever need to add a new `/api/*` endpoint, **default to `JSON_HEADERS_NOSTORE`** unless you have a specific reason to allow caching (and if you do, document that reason in a comment next to the route).
 
 ## Public path
 
@@ -154,13 +193,34 @@ docker exec onyx-cache redis-cli KEYS "stockgal:*"
 - Don't add Tailwind / a frontend framework (the editorial dark archive aesthetic is intentional and hand-rolled in `renderIndex`).
 - Don't change the lock owner format without updating both `stock-gallery::recoverStaleLock` and `comfy-mcp::acquireLock`.
 - Don't put user-controlled values in Redis keys.
+- Don't weaken the cache headers on `/` or `/api/*`. Default to `JSON_HEADERS_NOSTORE` / `HTML_HEADERS_NOSTORE`. See "Browser cache contracts" above.
+- Don't bump `@playwright/test` past `1.49.0` without also bumping the docker image — the bundled chromium binary version is locked to the package version.
+- Don't ship a feature without a corresponding test in `tests/e2e/stock-gallery.spec.mjs`. The suite is the gate for v3+.
 - Don't rebuild ComfyUI from scratch — the `yanwk/comfyui-boot:cu124-slim` base needs a `pre-start.sh` hook that `pip install`s `comfy_aimdo` (the upstream image forgets to). The hook lives in the `comfyui_data` named volume; if you ever recreate that volume, re-add it before starting the container.
 - Don't use `qwen_3_4b_fp8_mixed.safetensors` for the text encoder — it errors out with `AttributeError: 'NoneType' object has no attribute 'Params'` in this ComfyUI version. Use the bf16 variant.
+
+## Recent changes (2026-04-08)
+
+| Commit | What | Why |
+|---|---|---|
+| `497dabe` | feat(v2): gallery scale-up | WebP-by-default at gen, lazy `/thumb/` route, 50/page pagination, LLM-extracted hashtags via `qwen3.5:4b` after enhance, hashtag dropdown filter, Redis caching via `onyx-cache` |
+| `5259571` | docs: CLAUDE.md | This file |
+| `7652062` | fix(C1): comfy-mcp lock deadlock | Tagged comfy-mcp's lock with `"comfy-mcp"` owner string; extended `recoverStaleLock` to reap any foreign-owned lock older than 6 min (`STALE_LOCK_MAX_AGE_MS`). Without this fix, a SIGKILLed comfy-mcp left an unrecoverable lock that deadlocked gen, upscale, AND Bayou's Ollama dependency at the same time. |
+| `e724282` | fix: no-store + access logging | `/api/queue` polling was getting served stale browser cache, freezing the queue UI on a phantom "running" state forever. Applied `JSON_HEADERS_NOSTORE` to every `/api/*` response and `HTML_HEADERS_NOSTORE` to `/`. Also added `accessLog()` via `res.on("finish")` so future browser-side issues are diagnosable from `/state/stock-gallery.log`. |
+| `3b774b5` | test: playwright e2e suite | First automated tests in the repo. 7 specs in real headless Chromium, including the cache-header regression that would have caught `e724282`'s bug. |
 
 ## Where to read first when you join this codebase
 
 1. `README.md` — high-level diagram and GPU coordination story
-2. This file (`CLAUDE.md`) — operational + architectural details
-3. `/home/silverwulf/.claude/plans/mellow-prancing-boole.md` — full v1 + v2 + v3 plan history, code review, and four sweep reports. The "context compaction" section near the bottom is a single-paragraph state-of-the-world.
-4. `stock-gallery/server.mjs::processJob` — the heart of the gen pipeline, ~80 lines that touch every subsystem
-5. `stock-gallery/server.mjs::renderIndex` — the dynamic HTML build, including the embedded JS for the lightbox/queue/compose UI
+2. This file (`CLAUDE.md`) — operational + architectural details (you are here)
+3. `tests/e2e/stock-gallery.spec.mjs` — every assertion is a contract about live behavior; reading the tests is the fastest way to learn what the system does
+4. `/home/silverwulf/.claude/plans/mellow-prancing-boole.md` — full v1 + v2 + v3 plan history, code review, four sweep reports, and a session-summary block at the top. The plan file is intentionally outside the repo because it persists across CC sessions independently of git state.
+5. `stock-gallery/server.mjs::processJob` — the heart of the gen pipeline, ~80 lines that touch every subsystem
+6. `stock-gallery/server.mjs::renderIndex` — the dynamic HTML build, including the embedded JS for the lightbox/queue/compose UI
+
+## Lessons from the build (read these before changing anything load-bearing)
+
+1. **Curl smoke tests cannot model browser cache contracts.** The polling-freeze bug fixed in `e724282` was invisible to every curl-based test we ran for two iterations. Only a real-browser Playwright test caught it. If you're testing anything that depends on how a browser behaves over multiple requests with shared state, write a Playwright spec.
+2. **Two-process shared state is the source of subtle bugs.** Whenever you change anything that touches the lock file, the gallery folder, or Redis, audit BOTH `stock-gallery/server.mjs` AND `comfy-mcp/server.mjs`. The C1 deadlock fix in `7652062` is the canonical example.
+3. **Defer the easy decisions, ship the hard ones.** v2's "WebP-by-default at gen + lazy thumbnails + Redis cache" each individually saved 5-30 ms; bundled they took the gallery from "60 MB landing page" to "1 MB landing page". Don't spread the work across iterations when the items are coupled and share a rebuild dance.
+4. **The plan file is the long-term memory of the project.** Sessions get cleared; the file at `~/.claude/plans/mellow-prancing-boole.md` does not. When you finish a session, append a session summary to the top of that file so the next session has a one-glance starting context. The "context compaction" pattern there is the source of truth for "where are we right now".
