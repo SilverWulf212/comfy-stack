@@ -7,6 +7,6 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
     "dockerode": "^4.0.2",
-    "sharp": "^0.34.1"
+    "sharp": "^0.35.4"
   }
 }
